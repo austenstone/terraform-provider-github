@@ -10,18 +10,20 @@ import (
 	"strings"
 
 	"github.com/google/go-github/v67/github"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 )
 
 func resourceGithubRepository() *schema.Resource {
 	return &schema.Resource{
-		Create: resourceGithubRepositoryCreate,
-		Read:   resourceGithubRepositoryRead,
-		Update: resourceGithubRepositoryUpdate,
-		Delete: resourceGithubRepositoryDelete,
+		CreateContext: resourceGithubRepositoryCreate,
+		ReadContext:   resourceGithubRepositoryRead,
+		UpdateContext: resourceGithubRepositoryUpdate,
+		DeleteContext: resourceGithubRepositoryDelete,
 		Importer: &schema.ResourceImporter{
-			State: func(d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+			StateContext: func(ctx context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
 				if err := d.Set("auto_init", false); err != nil {
 					return nil, err
 				}
@@ -63,22 +65,24 @@ func resourceGithubRepository() *schema.Resource {
 				ValidateDiagFunc: toDiagFunc(validation.StringInSlice([]string{"public", "private", "internal"}, false), "visibility"),
 				Description:      "Can be 'public' or 'private'. If your organization is associated with an enterprise account using GitHub Enterprise Cloud or GitHub Enterprise Server 2.20+, visibility can also be 'internal'.",
 			},
+			// terraform-sdk-provider doesn't properly support tristate booleans: https://github.com/hashicorp/terraform-plugin-sdk/issues/817
+			// Using TypeString as the best alternative for now.
 			"fork": {
-				Type:        schema.TypeBool,
+				Type:        schema.TypeString,
 				Optional:    true,
-				ForceNew:    true,
+				Computed:    true,
 				Description: "Set to 'true' to fork an existing repository.",
 			},
 			"source_owner": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				ForceNew:    true,
+				Computed:    true,
 				Description: "The owner of the source repository to fork from.",
 			},
 			"source_repo": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				ForceNew:    true,
+				Computed:    true,
 				Description: "The name of the source repository to fork from.",
 			},
 			"security_and_analysis": {
@@ -387,7 +391,7 @@ func resourceGithubRepository() *schema.Resource {
 				Type:        schema.TypeBool,
 				Optional:    true,
 				Computed:    true,
-				Description: "Set to 'true' to enable security alerts for vulnerable dependencies. Enabling requires alerts to be enabled on the owner level. (Note for importing: GitHub enables the alerts on public repos but disables them on private repos by default). Note that vulnerability alerts have not been successfully tested on any GitHub Enterprise instance and may be unavailable in those settings.",
+				Description: "Set to 'true' to enable security alerts for vulnerable dependencies. Enabling requires alerts to be enabled on the owner level. (Note for importing: GitHub enables the alerts on all repos by default). Note that vulnerability alerts have not been successfully tested on any GitHub Enterprise instance and may be unavailable in those settings.",
 			},
 			"ignore_vulnerability_alerts_during_read": {
 				Type:        schema.TypeBool,
@@ -479,8 +483,30 @@ func resourceGithubRepository() *schema.Resource {
 				Description: " Set to 'true' to always suggest updating pull request branches.",
 			},
 		},
-		CustomizeDiff: customDiffFunction,
+		CustomizeDiff: customdiff.All(
+			customDiffFunction,
+			customdiff.ForceNewIfChange("fork", valueChangedButNotEmpty),
+			customdiff.ForceNewIfChange("source_repo", valueChangedButNotEmpty),
+			customdiff.ForceNewIfChange("source_owner", valueChangedButNotEmpty),
+		),
 	}
+}
+
+// valueChangedButNotEmpty is a customdiff function that triggers recreation of the resource
+// if the field's value changes from a non-empty state to a different non-empty value.
+func valueChangedButNotEmpty(ctx context.Context, oldVal, newVal, meta any) bool {
+	oldValStr := oldVal.(string)
+	newValStr := newVal.(string)
+	return oldValStr != "" && oldValStr != newValStr
+}
+
+func customDiffFunction(_ context.Context, diff *schema.ResourceDiff, v any) error {
+	if diff.HasChange("name") {
+		if err := diff.SetNewComputed("full_name"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func calculateVisibility(d *schema.ResourceData) string {
@@ -595,18 +621,17 @@ func resourceGithubRepositoryObject(d *schema.ResourceData) *github.Repository {
 	return repository
 }
 
-func resourceGithubRepositoryCreate(d *schema.ResourceData, meta any) error {
+func resourceGithubRepositoryCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	client := meta.(*Owner).v3client
 
 	if branchName, hasDefaultBranch := d.GetOk("default_branch"); hasDefaultBranch && (branchName != "main") {
-		return fmt.Errorf("cannot set the default branch on a new repository to something other than 'main'")
+		return diag.Errorf("cannot set the default branch on a new repository to something other than 'main'")
 	}
 
 	repoReq := resourceGithubRepositoryObject(d)
 	owner := meta.(*Owner).name
 
 	repoName := repoReq.GetName()
-	ctx := context.Background()
 
 	// determine if repository should be private. assume public to start
 	isPrivate := false
@@ -632,7 +657,7 @@ func resourceGithubRepositoryCreate(d *schema.ResourceData, meta any) error {
 		for _, templateConfigBlock := range templateConfigBlocks {
 			templateConfigMap, ok := templateConfigBlock.(map[string]any)
 			if !ok {
-				return errors.New("failed to unpack template configuration block")
+				return diag.FromErr(errors.New("failed to unpack template configuration block"))
 			}
 
 			templateRepo := templateConfigMap["repository"].(string)
@@ -653,21 +678,20 @@ func resourceGithubRepositoryCreate(d *schema.ResourceData, meta any) error {
 				&templateRepoReq,
 			)
 			if err != nil {
-				return err
+				return diag.FromErr(err)
 			}
 
 			d.SetId(*repo.Name)
 		}
-	} else if d.Get("fork").(bool) {
+	} else if d.Get("fork").(string) == "true" {
 		// Handle repository forking
 		sourceOwner := d.Get("source_owner").(string)
 		sourceRepo := d.Get("source_repo").(string)
 		requestedName := d.Get("name").(string)
-		owner := meta.(*Owner).name
 		log.Printf("[INFO] Creating fork of %s/%s in %s", sourceOwner, sourceRepo, owner)
 
 		if sourceOwner == "" || sourceRepo == "" {
-			return fmt.Errorf("source_owner and source_repo must be provided when forking a repository")
+			return diag.Errorf("source_owner and source_repo must be provided when forking a repository")
 		}
 
 		// Create the fork using the GitHub client library
@@ -688,18 +712,18 @@ func resourceGithubRepositoryCreate(d *schema.ResourceData, meta any) error {
 				log.Printf("[INFO] Fork is being created asynchronously")
 				// Despite the 202 status, the API should still return preliminary fork information
 				if fork == nil {
-					return fmt.Errorf("fork information not available after accepted status")
+					return diag.Errorf("fork information not available after accepted status")
 				}
 				log.Printf("[DEBUG] Fork name: %s", fork.GetName())
 			} else {
-				return fmt.Errorf("failed to create fork: %w", err)
+				return diag.Errorf("failed to create fork: %s", err.Error())
 			}
 		} else if resp != nil {
 			log.Printf("[DEBUG] Fork response status: %d", resp.StatusCode)
 		}
 
 		if fork == nil {
-			return fmt.Errorf("fork creation failed - no repository returned")
+			return diag.Errorf("fork creation failed - no repository returned")
 		}
 
 		log.Printf("[INFO] Fork created with name: %s", fork.GetName())
@@ -723,7 +747,7 @@ func resourceGithubRepositoryCreate(d *schema.ResourceData, meta any) error {
 			repo, _, err = client.Repositories.Create(ctx, "", repoReq)
 		}
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 		d.SetId(repo.GetName())
 	}
@@ -732,7 +756,7 @@ func resourceGithubRepositoryCreate(d *schema.ResourceData, meta any) error {
 	if len(topics) > 0 {
 		_, _, err := client.Repositories.ReplaceAllTopics(ctx, owner, repoName, topics)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	}
 
@@ -740,19 +764,19 @@ func resourceGithubRepositoryCreate(d *schema.ResourceData, meta any) error {
 	if pages != nil {
 		_, _, err := client.Repositories.EnablePages(ctx, owner, repoName, pages)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	}
 
 	err := updateVulnerabilityAlerts(d, client, ctx, owner, repoName)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
-	return resourceGithubRepositoryUpdate(d, meta)
+	return resourceGithubRepositoryUpdate(ctx, d, meta)
 }
 
-func resourceGithubRepositoryRead(d *schema.ResourceData, meta any) error {
+func resourceGithubRepositoryRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	client := meta.(*Owner).v3client
 
 	owner := meta.(*Owner).name
@@ -764,14 +788,14 @@ func resourceGithubRepositoryRead(d *schema.ResourceData, meta any) error {
 		owner = explicitOwner
 	}
 
-	ctx := context.WithValue(context.Background(), ctxId, d.Id())
+	ctx = context.WithValue(ctx, ctxId, d.Id())
 	if !d.IsNewResource() {
 		ctx = context.WithValue(ctx, ctxEtag, d.Get("etag").(string))
 	}
 
 	repo, resp, err := client.Repositories.Get(ctx, owner, repoName)
 	if err != nil {
-		ghErr := &github.ErrorResponse{}
+		var ghErr *github.ErrorResponse
 		if errors.As(err, &ghErr) {
 			if ghErr.Response.StatusCode == http.StatusNotModified {
 				return nil
@@ -783,7 +807,7 @@ func resourceGithubRepositoryRead(d *schema.ResourceData, meta any) error {
 				return nil
 			}
 		}
-		return err
+		return diag.FromErr(err)
 	}
 
 	_ = d.Set("etag", resp.Header.Get("ETag"))
@@ -829,16 +853,16 @@ func resourceGithubRepositoryRead(d *schema.ResourceData, meta any) error {
 	if repo.GetHasPages() {
 		pages, _, err := client.Repositories.GetPagesInfo(ctx, owner, repoName)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 		if err := d.Set("pages", flattenPages(pages)); err != nil {
-			return fmt.Errorf("error setting pages: %w", err)
+			return diag.Errorf("error setting pages: %s", err.Error())
 		}
 	}
 
 	// Set fork information if this is a fork
 	if repo.GetFork() {
-		_ = d.Set("fork", true)
+		_ = d.Set("fork", "true")
 
 		// If the repository has parent information, set the source details
 		if repo.Parent != nil {
@@ -846,7 +870,7 @@ func resourceGithubRepositoryRead(d *schema.ResourceData, meta any) error {
 			_ = d.Set("source_repo", repo.Parent.GetName())
 		}
 	} else {
-		_ = d.Set("fork", false)
+		_ = d.Set("fork", "false")
 		_ = d.Set("source_owner", "")
 		_ = d.Set("source_repo", "")
 	}
@@ -858,32 +882,32 @@ func resourceGithubRepositoryRead(d *schema.ResourceData, meta any) error {
 				"repository": repo.TemplateRepository.Name,
 			},
 		}); err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	} else {
 		if err = d.Set("template", []any{}); err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	}
 
 	if !d.Get("ignore_vulnerability_alerts_during_read").(bool) {
 		vulnerabilityAlerts, _, err := client.Repositories.GetVulnerabilityAlerts(ctx, owner, repoName)
 		if err != nil {
-			return fmt.Errorf("error reading repository vulnerability alerts: %w", err)
+			return diag.Errorf("error reading repository vulnerability alerts: %s", err.Error())
 		}
 		if err = d.Set("vulnerability_alerts", vulnerabilityAlerts); err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	}
 
 	if err = d.Set("security_and_analysis", flattenSecurityAndAnalysis(repo.GetSecurityAndAnalysis())); err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	return nil
 }
 
-func resourceGithubRepositoryUpdate(d *schema.ResourceData, meta any) error {
+func resourceGithubRepositoryUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	// Can only update a repository if it is not archived or the update is to
 	// archive the repository (unarchiving is not supported by the GitHub API)
 	if d.Get("archived").(bool) && !d.HasChange("archived") {
@@ -913,7 +937,7 @@ func resourceGithubRepositoryUpdate(d *schema.ResourceData, meta any) error {
 
 	repoName := d.Id()
 	owner := meta.(*Owner).name
-	ctx := context.WithValue(context.Background(), ctxId, d.Id())
+	ctx = context.WithValue(ctx, ctxId, d.Id())
 
 	// When the organization has "Require sign off on web-based commits" enabled,
 	// the API doesn't allow you to send `web_commit_signoff_required` in order to
@@ -931,7 +955,7 @@ func resourceGithubRepositoryUpdate(d *schema.ResourceData, meta any) error {
 
 	repo, _, err := client.Repositories.Edit(ctx, owner, repoName, repoReq)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 	d.SetId(*repo.Name)
 
@@ -940,7 +964,7 @@ func resourceGithubRepositoryUpdate(d *schema.ResourceData, meta any) error {
 		if opts != nil {
 			pages, res, err := client.Repositories.GetPagesInfo(ctx, owner, repoName)
 			if res.StatusCode != http.StatusNotFound && err != nil {
-				return err
+				return diag.FromErr(err)
 			}
 
 			if pages == nil {
@@ -949,12 +973,12 @@ func resourceGithubRepositoryUpdate(d *schema.ResourceData, meta any) error {
 				_, err = client.Repositories.UpdatePages(ctx, owner, repoName, opts)
 			}
 			if err != nil {
-				return err
+				return diag.FromErr(err)
 			}
 		} else {
 			_, err := client.Repositories.DisablePages(ctx, owner, repoName)
 			if err != nil {
-				return err
+				return diag.FromErr(err)
 			}
 		}
 	}
@@ -963,7 +987,7 @@ func resourceGithubRepositoryUpdate(d *schema.ResourceData, meta any) error {
 		topics := repoReq.Topics
 		_, _, err = client.Repositories.ReplaceAllTopics(ctx, owner, *repo.Name, topics)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 		d.SetId(*repo.Name)
 
@@ -971,7 +995,7 @@ func resourceGithubRepositoryUpdate(d *schema.ResourceData, meta any) error {
 			topics := repoReq.Topics
 			_, _, err = client.Repositories.ReplaceAllTopics(ctx, owner, *repo.Name, topics)
 			if err != nil {
-				return err
+				return diag.FromErr(err)
 			}
 		}
 	}
@@ -979,7 +1003,7 @@ func resourceGithubRepositoryUpdate(d *schema.ResourceData, meta any) error {
 	if d.HasChange("vulnerability_alerts") {
 		err = updateVulnerabilityAlerts(d, client, ctx, owner, repoName)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	}
 
@@ -990,7 +1014,7 @@ func resourceGithubRepositoryUpdate(d *schema.ResourceData, meta any) error {
 		_, resp, err := client.Repositories.Edit(ctx, owner, repoName, repoReq)
 		if err != nil {
 			if resp.StatusCode != 422 || !strings.Contains(err.Error(), fmt.Sprintf("Visibility is already %s", n.(string))) {
-				return err
+				return diag.FromErr(err)
 			}
 		}
 	} else {
@@ -1004,21 +1028,21 @@ func resourceGithubRepositoryUpdate(d *schema.ResourceData, meta any) error {
 		_, _, err = client.Repositories.Edit(ctx, owner, repoName, repoReq)
 		if err != nil {
 			if !strings.Contains(err.Error(), "422 Privacy is already set") {
-				return err
+				return diag.FromErr(err)
 			}
 		}
 	} else {
 		log.Printf("[DEBUG] No privacy update required. private: %v", d.Get("private"))
 	}
 
-	return resourceGithubRepositoryRead(d, meta)
+	return resourceGithubRepositoryRead(ctx, d, meta)
 }
 
-func resourceGithubRepositoryDelete(d *schema.ResourceData, meta any) error {
+func resourceGithubRepositoryDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	client := meta.(*Owner).v3client
 	repoName := d.Id()
 	owner := meta.(*Owner).name
-	ctx := context.WithValue(context.Background(), ctxId, d.Id())
+	ctx = context.WithValue(ctx, ctxId, d.Id())
 
 	archiveOnDestroy := d.Get("archive_on_destroy").(bool)
 	if archiveOnDestroy {
@@ -1027,20 +1051,20 @@ func resourceGithubRepositoryDelete(d *schema.ResourceData, meta any) error {
 			return nil
 		} else {
 			if err := d.Set("archived", true); err != nil {
-				return err
+				return diag.FromErr(err)
 			}
 			repoReq := resourceGithubRepositoryObject(d)
 			// Always remove `web_commit_signoff_required` when archiving, to avoid 422 error
 			repoReq.WebCommitSignoffRequired = nil
 			log.Printf("[DEBUG] Archiving repository on delete: %s/%s", owner, repoName)
 			_, _, err := client.Repositories.Edit(ctx, owner, repoName, repoReq)
-			return err
+			return diag.FromErr(err)
 		}
 	}
 
 	log.Printf("[DEBUG] Deleting repository: %s/%s", owner, repoName)
 	_, err := client.Repositories.Delete(ctx, owner, repoName)
-	return err
+	return diag.FromErr(err)
 }
 
 func expandPages(input []any) *github.Pages {
@@ -1218,21 +1242,23 @@ func resourceGithubParseFullName(resourceDataLike interface {
 	return parts[0], parts[1], true
 }
 
-func customDiffFunction(_ context.Context, diff *schema.ResourceDiff, v any) error {
-	if diff.HasChange("name") {
-		if err := diff.SetNewComputed("full_name"); err != nil {
-			return err
+func updateVulnerabilityAlerts(d *schema.ResourceData, client *github.Client, ctx context.Context, owner, repoName string) error {
+	updateVulnerabilityAlertsSDK := client.Repositories.DisableVulnerabilityAlerts
+	vulnerabilityAlerts, ok := d.GetOk("vulnerability_alerts")
+
+	// Only if the vulnerability alerts are specifically set to true, enable them.
+	// Otherwise, disable them as GitHub defaults to enabled and we have not wanted to introduce a breaking change for this yet.
+	if ok && vulnerabilityAlerts.(bool) {
+		updateVulnerabilityAlertsSDK = client.Repositories.EnableVulnerabilityAlerts
+	}
+
+	resp, err := updateVulnerabilityAlertsSDK(ctx, owner, repoName)
+	if err != nil {
+		// Check if the error is because an Organization or Enterprise policy is preventing the change
+		// This is a temporary workaround while we extract Vulnerability Alerts into a separate resource.
+		if resp.StatusCode == http.StatusUnprocessableEntity && strings.Contains(err.Error(), "An enforced security configuration prevented modifying") && !ok {
+			return nil
 		}
 	}
-	return nil
-}
-
-func updateVulnerabilityAlerts(d *schema.ResourceData, client *github.Client, ctx context.Context, owner, repoName string) error {
-	updateVulnerabilityAlerts := client.Repositories.DisableVulnerabilityAlerts
-	if vulnerabilityAlerts, ok := d.GetOk("vulnerability_alerts"); ok && vulnerabilityAlerts.(bool) {
-		updateVulnerabilityAlerts = client.Repositories.EnableVulnerabilityAlerts
-	}
-
-	_, err := updateVulnerabilityAlerts(ctx, owner, repoName)
 	return err
 }

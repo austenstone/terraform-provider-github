@@ -625,7 +625,7 @@ func resourceGithubOrganizationRulesetRead(d *schema.ResourceData, meta any) err
 
 	ruleset, resp, err = client.Organizations.GetOrganizationRuleset(ctx, owner, rulesetID)
 	if err != nil {
-		ghErr := &github.ErrorResponse{}
+		var ghErr *github.ErrorResponse
 		if errors.As(err, &ghErr) {
 			if ghErr.Response.StatusCode == http.StatusNotModified {
 				return nil
@@ -637,6 +637,7 @@ func resourceGithubOrganizationRulesetRead(d *schema.ResourceData, meta any) err
 				return nil
 			}
 		}
+		return err
 	}
 
 	_ = d.Set("etag", resp.Header.Get("ETag"))

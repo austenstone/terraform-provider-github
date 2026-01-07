@@ -77,15 +77,12 @@ func resourceGithubActionsEnvironmentVariableCreateOrUpdate(d *schema.ResourceDa
 	// Try to create the variable first
 	_, err := client.Actions.CreateEnvVariable(ctx, owner, repoName, escapedEnvName, variable)
 	if err != nil {
-		ghErr := &github.ErrorResponse{}
-		if errors.As(err, &ghErr) {
-			if ghErr.Response.StatusCode == http.StatusConflict {
-				// Variable already exists, try to update instead
-				_, err = client.Actions.UpdateEnvVariable(ctx, owner, repoName, escapedEnvName, variable)
-				if err != nil {
-					return err
-				}
-			} else {
+		var ghErr *github.ErrorResponse
+		if errors.As(err, &ghErr) && ghErr.Response.StatusCode == http.StatusConflict {
+			// Variable already exists, try to update instead
+			// If it fails here, we want to return the error otherwise continue
+			_, err = client.Actions.UpdateEnvVariable(ctx, owner, repoName, escapedEnvName, variable)
+			if err != nil {
 				return err
 			}
 		} else {
@@ -110,7 +107,7 @@ func resourceGithubActionsEnvironmentVariableRead(d *schema.ResourceData, meta a
 
 	variable, _, err := client.Actions.GetEnvVariable(ctx, owner, repoName, escapedEnvName, name)
 	if err != nil {
-		ghErr := &github.ErrorResponse{}
+		var ghErr *github.ErrorResponse
 		if errors.As(err, &ghErr) {
 			if ghErr.Response.StatusCode == http.StatusNotFound {
 				log.Printf("[INFO] Removing actions variable %s from state because it no longer exists in GitHub",
