@@ -180,10 +180,7 @@ func testRunnerGroupNetworkingLifecycle(t *testing.T, runnerGroup func() *schema
 				return
 			}
 			if request["network_configuration_id"] == "" {
-				t.Errorf("empty network_configuration_id in %s request; omit an unassigned configuration or use null to detach", r.Method)
-				w.WriteHeader(http.StatusUnprocessableEntity)
-				fmt.Fprint(w, `{"message":"network_configuration_id must be a configuration ID or null"}`)
-				return
+				t.Errorf("provider sent an empty-string network_configuration_id in a %s request", r.Method)
 			}
 			maps.Copy(group, request)
 		}
