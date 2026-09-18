@@ -179,6 +179,12 @@ func testRunnerGroupNetworkingLifecycle(t *testing.T, runnerGroup func() *schema
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
+			if request["network_configuration_id"] == "" {
+				t.Errorf("empty network_configuration_id in %s request; omit an unassigned configuration or use null to detach", r.Method)
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				fmt.Fprint(w, `{"message":"network_configuration_id must be a configuration ID or null"}`)
+				return
+			}
 			maps.Copy(group, request)
 		}
 		if err := json.NewEncoder(w).Encode(group); err != nil {
@@ -226,9 +232,17 @@ func testRunnerGroupNetworkingLifecycle(t *testing.T, runnerGroup func() *schema
 		},
 		Steps: []resource.TestStep{
 			{
+				Config: fmt.Sprintf(config, ""),
+				ConfigStateChecks: []statecheck.StateCheck{
+					unchangedID.AddStateValue(resourceName, tfjsonpath.New("id")),
+					statecheck.ExpectKnownValue(resourceName, tfjsonpath.New("network_configuration_id"), knownvalue.StringExact("")),
+				},
+			},
+			{
 				Config: attachedConfig,
 				ConfigStateChecks: []statecheck.StateCheck{
 					unchangedID.AddStateValue(resourceName, tfjsonpath.New("id")),
+					statecheck.ExpectKnownValue(resourceName, tfjsonpath.New("network_configuration_id"), knownvalue.StringExact("network-1")),
 				},
 			},
 			{
